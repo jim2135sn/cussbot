@@ -10,6 +10,7 @@ import os
 
 BOT_CODE_URL = "https://raw.githubusercontent.com/jim2135sn/cussbot/main/cussbot.py?v=2"
 RESPONSES_URL = "https://raw.githubusercontent.com/jim2135sn/cussbot/main/responses.json?v=2"
+WORDS_URL = "https://raw.githubusercontent.com/jim2135sn/cussbot/main/words.json?v=2"
 SELF_URL = "https://raw.githubusercontent.com/jim2135sn/cussbot/main/run_bot.py?v=2"
 
 def self_update():
@@ -44,6 +45,17 @@ def update_responses():
     except Exception as e:
         print(f"Warning: Could not update responses.json: {e}")
 
+def update_words():
+    print("Updating words.json from GitHub...")
+    try:
+        with urllib.request.urlopen(WORDS_URL, timeout=30) as response:
+            data = response.read()
+        with open("words.json", "wb") as f:
+            f.write(data)
+        print(f"Updated words.json ({len(data)} bytes)")
+    except Exception as e:
+        print(f"Warning: Could not update words.json: {e}")
+
 def fetch_and_run():
     print("=" * 50)
     print("Cussbot Remote Loader")
@@ -54,6 +66,7 @@ def fetch_and_run():
     print()
     
     update_responses()
+    update_words()
     print()
     
     print("Fetching latest bot code from GitHub...")
