@@ -229,8 +229,7 @@ async def on_message(message):
 @tree.command(name="cussconfig", description="Configure cussbot settings for this server (Admin only)")
 @app_commands.describe(
     action="What to configure",
-    channel="Channel for responses (for set_channel)",
-    enabled="Enable or disable responses (for toggle_responses)"
+    channel="Channel for responses (for set_channel)"
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="Set response channel", value="set_channel"),
