@@ -22,32 +22,47 @@ responses = []
 
 COUNTS_FILE = "counts.json"
 counts = {
-    "global": 0,
-    "servers": {}
+    "global_total": 0,
+    "server_totals": {},
+    "global_users": {},
+    "server_users": {}
 }
 
 def load_counts():
     global counts
     try:
         with open(COUNTS_FILE, 'r') as f:
-            counts = json.load(f)
+            loaded = json.load(f)
+            counts.update(loaded)
     except FileNotFoundError:
         pass
 
 def save_counts():
     with open(COUNTS_FILE, 'w') as f:
-        json.dump(counts, f)
+        json.dump(counts, f, indent=2)
 
-def add_cuss(server_id: str):
-    """Add a cuss to both global and server counter"""
-    counts["global"] += 1
-    if server_id not in counts["servers"]:
-        counts["servers"][server_id] = 0
-    counts["servers"][server_id] += 1
+def add_cuss(server_id: str, user_id: str, username: str):
+    counts["global_total"] += 1
+    
+    if server_id not in counts["server_totals"]:
+        counts["server_totals"][server_id] = 0
+    counts["server_totals"][server_id] += 1
+    
+    if user_id not in counts["global_users"]:
+        counts["global_users"][user_id] = {"name": username, "count": 0}
+    counts["global_users"][user_id]["count"] += 1
+    counts["global_users"][user_id]["name"] = username
+    
+    if server_id not in counts["server_users"]:
+        counts["server_users"][server_id] = {}
+    if user_id not in counts["server_users"][server_id]:
+        counts["server_users"][server_id][user_id] = {"name": username, "count": 0}
+    counts["server_users"][server_id][user_id]["count"] += 1
+    counts["server_users"][server_id][user_id]["name"] = username
+    
     save_counts()
 
 def check_for_cuss(message_content: str) -> bool:
-    """Check if message contains any cuss word"""
     content_lower = message_content.lower()
     for word in cuss_words:
         if word.lower() in content_lower:
@@ -55,12 +70,14 @@ def check_for_cuss(message_content: str) -> bool:
     return False
 
 def get_random_response() -> str:
-    """Get a random response"""
     if responses:
         return random.choice(responses)
     return "Watch your language!"
 
-# my id hehe
+def get_top_users(user_dict: dict, limit: int = 10) -> list:
+    sorted_users = sorted(user_dict.items(), key=lambda x: x[1]["count"], reverse=True)
+    return sorted_users[:limit]
+
 BOT_OWNER_ID = 971232904296402944
 
 @client.event
@@ -68,15 +85,15 @@ async def on_ready():
     global cuss_words, responses
     
     print(f'Logged in as {client.user}!')
-
+    
     cuss_words = load_json("words.json")
     responses = load_json("responses.json")
     load_counts()
     
     print(f'Loaded {len(cuss_words)} cuss words')
     print(f'Loaded {len(responses)} responses')
-    print(f'Global cuss count: {counts["global"]}')
-
+    print(f'Global cuss count: {counts["global_total"]}')
+    
     print('Syncing slash commands...')
     await tree.sync()
     print('Slash commands synced!')
@@ -87,29 +104,80 @@ async def on_message(message):
     if message.author.bot:
         return
     
-  
     if message.content == "!?&restart" and message.author.id == BOT_OWNER_ID:
         await message.channel.send("Rebooting...")
         print(f"\n[REBOOT] Reboot requested by {message.author}")
         await client.close()
         return
     
-    if check_for_cuss(message.content):
-        server_id = str(message.guild.id) if message.guild else "dm"
-        add_cuss(server_id)
+    if message.guild and check_for_cuss(message.content):
+        server_id = str(message.guild.id)
+        user_id = str(message.author.id)
+        username = message.author.display_name
+        
+        add_cuss(server_id, user_id, username)
         
         response = get_random_response()
         await message.reply(response)
 
-@tree.command(name="cussstats", description="See the cuss counter stats")
-async def cussstats(interaction: discord.Interaction):
-    server_id = str(interaction.guild.id) if interaction.guild else "dm"
-    server_count = counts["servers"].get(server_id, 0)
-    global_count = counts["global"]
+@tree.command(name="serverboard", description="Top 10 cussers in this server")
+async def serverboard(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command only works in servers!", ephemeral=True)
+        return
     
-    embed = discord.Embed(title="Cuss Counter Stats")
-    embed.add_field(name="This Server", value=str(server_count), inline=True)
-    embed.add_field(name="Global", value=str(global_count), inline=True)
+    server_id = str(interaction.guild.id)
+    server_users = counts["server_users"].get(server_id, {})
+    
+    top_users = get_top_users(server_users, 10)
+    
+    if not top_users:
+        await interaction.response.send_message("No cusses recorded in this server yet!", ephemeral=True)
+        return
+    
+    embed = discord.Embed(title=f"Top 10 Cussers - {interaction.guild.name}")
+    
+    leaderboard = ""
+    for i, (user_id, data) in enumerate(top_users, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        leaderboard += f"{medal} **{data['name']}** - {data['count']} cusses\n"
+    
+    embed.description = leaderboard
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="globalboard", description="Top 10 cussers globally")
+async def globalboard(interaction: discord.Interaction):
+    top_users = get_top_users(counts["global_users"], 10)
+    
+    if not top_users:
+        await interaction.response.send_message("No cusses recorded yet!", ephemeral=True)
+        return
+    
+    embed = discord.Embed(title="Top 10 Global Cussers")
+    
+    leaderboard = ""
+    for i, (user_id, data) in enumerate(top_users, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        leaderboard += f"{medal} **{data['name']}** - {data['count']} cusses\n"
+    
+    embed.description = leaderboard
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="cusstotal", description="Total cuss counts for this server and globally")
+async def cusstotal(interaction: discord.Interaction):
+    global_total = counts["global_total"]
+    
+    server_total = 0
+    if interaction.guild:
+        server_id = str(interaction.guild.id)
+        server_total = counts["server_totals"].get(server_id, 0)
+    
+    embed = discord.Embed(title="Cuss Counter Totals")
+    
+    if interaction.guild:
+        embed.add_field(name="This Server", value=f"**{server_total}** cusses", inline=True)
+    
+    embed.add_field(name="Global", value=f"**{global_total}** cusses", inline=True)
     
     await interaction.response.send_message(embed=embed)
 
@@ -128,8 +196,8 @@ if __name__ == "__main__":
         with open("token.txt", "r") as f:
             TOKEN = f.read().strip()
         
-        if not TOKEN or TOKEN == "replacethiseventually":
-            print("u forgor your token numnut")
+        if not TOKEN or TOKEN == "YOUR_BOT_TOKEN_HERE":
+            print("Please add your Discord bot token to token.txt!")
             exit(1)
         
         print("Token loaded successfully!")
