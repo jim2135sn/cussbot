@@ -4,6 +4,8 @@ import json
 import random
 import os
 import time
+import re
+import difflib
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -43,6 +45,8 @@ user_cooldowns = {}
 COOLDOWN_TRIGGER_COUNT = 3
 COOLDOWN_TRIGGER_WINDOW = 3
 COOLDOWN_DURATION = 10
+
+AVAILABLE_TAGS = ["general", "sexual", "lgbtq", "racial", "religious", "shock"]
 
 def load_counts():
     global counts
@@ -85,9 +89,25 @@ def get_server_settings(server_id: str) -> dict:
     if server_id not in server_config:
         server_config[server_id] = {
             "response_channel": None,
-            "responses_enabled": True
+            "responses_enabled": True,
+            "delete_messages": False,
+            "delete_severity": 3,
+            "scoreboard_enabled": True,
+            "close_match_detection": False,
+            "filtered_tags": []
         }
-    return server_config[server_id]
+    settings = server_config[server_id]
+    if "delete_messages" not in settings:
+        settings["delete_messages"] = False
+    if "delete_severity" not in settings:
+        settings["delete_severity"] = 3
+    if "scoreboard_enabled" not in settings:
+        settings["scoreboard_enabled"] = True
+    if "close_match_detection" not in settings:
+        settings["close_match_detection"] = False
+    if "filtered_tags" not in settings:
+        settings["filtered_tags"] = []
+    return settings
 
 def check_cooldown(user_id: str) -> bool:
     current_time = time.time()
@@ -151,12 +171,87 @@ def add_cuss(server_id: str, user_id: str, username: str):
     
     add_user_cuss(user_id, username, server_id)
 
-def check_for_cuss(message_content: str) -> bool:
-    content_lower = message_content.lower()
-    for word in cuss_words:
-        if word.lower() in content_lower:
+def pattern_to_regex(pattern: str) -> str:
+    escaped = ""
+    for char in pattern:
+        if char == '*':
+            escaped += ".*"
+        elif char in r'\^$.|?+()[]{}':
+            escaped += '\\' + char
+        else:
+            escaped += char
+    return escaped
+
+def check_exception(word: str, exceptions: list) -> bool:
+    word_lower = word.lower()
+    for exc in exceptions:
+        exc_pattern = pattern_to_regex(exc.lower())
+        if re.fullmatch(exc_pattern, word_lower):
             return True
     return False
+
+def check_for_cuss(message_content: str, settings: dict) -> dict:
+    if not isinstance(message_content, str):
+        return {"matched": False}
+    content_lower = message_content.lower()
+    words_in_message = re.findall(r'\b[\w\'-]+\b', content_lower)
+    
+    filtered_tags = settings.get("filtered_tags", [])
+    close_match = settings.get("close_match_detection", False)
+    
+    for word_entry in cuss_words:
+        if not isinstance(word_entry, dict):
+            continue
+        word_id = word_entry.get("id", "")
+        match_raw = word_entry.get("match", "")
+        if not isinstance(match_raw, str):
+            continue
+        match_patterns = match_raw.split("|")
+        tags = word_entry.get("tags", [])
+        severity = word_entry.get("severity", 1)
+        exceptions = word_entry.get("exceptions", [])
+        
+        if filtered_tags and not any(tag in filtered_tags for tag in tags):
+            continue
+        
+        for pattern in match_patterns:
+            pattern = pattern.strip()
+            if not pattern:
+                continue
+            
+            if '*' in pattern:
+                regex_pattern = pattern_to_regex(pattern)
+                for msg_word in words_in_message:
+                    if re.fullmatch(regex_pattern, msg_word):
+                        if not check_exception(msg_word, exceptions):
+                            return {"matched": True, "severity": severity, "tags": tags, "id": word_id, "word": msg_word}
+                if re.search(regex_pattern, content_lower):
+                    matched_text = re.search(regex_pattern, content_lower).group()
+                    if not check_exception(matched_text, exceptions):
+                        return {"matched": True, "severity": severity, "tags": tags, "id": word_id, "word": matched_text}
+            else:
+                if ' ' in pattern:
+                    if pattern in content_lower:
+                        if not check_exception(pattern, exceptions):
+                            return {"matched": True, "severity": severity, "tags": tags, "id": word_id, "word": pattern}
+                else:
+                    for msg_word in words_in_message:
+                        if msg_word == pattern:
+                            if not check_exception(msg_word, exceptions):
+                                return {"matched": True, "severity": severity, "tags": tags, "id": word_id, "word": msg_word}
+        
+        if close_match:
+            for pattern in match_patterns:
+                pattern = pattern.strip()
+                if not pattern or '*' in pattern or ' ' in pattern:
+                    continue
+                for msg_word in words_in_message:
+                    similarity = difflib.SequenceMatcher(None, msg_word, pattern).ratio()
+                    if similarity >= 0.8 and msg_word != pattern:
+                        if not check_exception(msg_word, exceptions):
+                            return {"matched": True, "severity": severity, "tags": tags, "id": word_id, "word": msg_word, "close_match": True}
+    
+    return {"matched": False}
 
 def get_random_response() -> str:
     if responses:
@@ -202,29 +297,283 @@ async def on_message(message):
         await client.close()
         return
     
-    if message.guild and check_for_cuss(message.content):
+    if message.guild:
         server_id = str(message.guild.id)
         user_id = str(message.author.id)
         username = message.author.display_name
         
-        add_cuss(server_id, user_id, username)
-        
         settings = get_server_settings(server_id)
         
-        if not settings["responses_enabled"]:
+        result = check_for_cuss(message.content, settings)
+        
+        if result["matched"]:
+            severity = result["severity"]
+            
+            if settings["scoreboard_enabled"]:
+                add_cuss(server_id, user_id, username)
+            
+            if settings["delete_messages"] and severity >= settings["delete_severity"]:
+                try:
+                    await message.delete()
+                except discord.errors.Forbidden:
+                    pass
+            
+            if not settings["responses_enabled"]:
+                return
+            
+            if check_cooldown(user_id):
+                return
+            
+            response = get_random_response()
+            
+            if settings["response_channel"]:
+                channel = client.get_channel(int(settings["response_channel"]))
+                if channel:
+                    await channel.send(f"{message.author.mention}: {response}")
+            else:
+                try:
+                    await message.reply(response)
+                except discord.errors.NotFound:
+                    pass
+
+@tree.command(name="cusshelp", description="Show help for all Cussbot commands")
+async def cusshelp(interaction: discord.Interaction):
+    embed = discord.Embed(title="Cussbot Help", description="All available commands")
+    
+    embed.add_field(
+        name="/cusshelp",
+        value="Shows this help message",
+        inline=False
+    )
+    embed.add_field(
+        name="/serverboard",
+        value="Show top 10 cussers in this server",
+        inline=False
+    )
+    embed.add_field(
+        name="/globalboard",
+        value="Show top 10 cussers globally",
+        inline=False
+    )
+    embed.add_field(
+        name="/cusstotal",
+        value="Show total cuss counts for this server and globally",
+        inline=False
+    )
+    embed.add_field(
+        name="/cussconfig (Admin)",
+        value="Configure response channel and enable/disable responses",
+        inline=False
+    )
+    embed.add_field(
+        name="/cussdelete (Admin)",
+        value="Toggle message deletion and set severity threshold (1-4)",
+        inline=False
+    )
+    embed.add_field(
+        name="/cussscoreboard (Admin)",
+        value="Toggle scoreboard tracking for this server",
+        inline=False
+    )
+    embed.add_field(
+        name="/cussmatch (Admin)",
+        value="Toggle close match detection for misspellings",
+        inline=False
+    )
+    embed.add_field(
+        name="/cusstags (Admin)",
+        value="Configure which tags to filter (general, sexual, lgbtq, racial, religious, shock)",
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="cussdelete", description="Configure message deletion for swears (Admin only)")
+@app_commands.describe(
+    action="Enable, disable, or view status",
+    severity="Minimum severity to delete (1=Low, 2=Medium, 3=High, 4=Extreme)"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Enable deletion", value="enable"),
+    app_commands.Choice(name="Disable deletion", value="disable"),
+    app_commands.Choice(name="View status", value="status"),
+])
+@app_commands.choices(severity=[
+    app_commands.Choice(name="1 - Low (bloody, ass, boob)", value=1),
+    app_commands.Choice(name="2 - Medium (anal, bullshit, apeshit)", value=2),
+    app_commands.Choice(name="3 - High (bitch, bastard, slurs)", value=3),
+    app_commands.Choice(name="4 - Extreme (2girls1cup, 1man1jar, barely legal)", value=4),
+])
+async def cussdelete(
+    interaction: discord.Interaction,
+    action: str,
+    severity: int = None
+):
+    if not interaction.guild:
+        await interaction.response.send_message("This command only works in servers!", ephemeral=True)
+        return
+    
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You need administrator permission to use this command.", ephemeral=True)
+        return
+    
+    server_id = str(interaction.guild.id)
+    settings = get_server_settings(server_id)
+    
+    if action == "enable":
+        settings["delete_messages"] = True
+        if severity is not None:
+            settings["delete_severity"] = severity
+        save_server_config()
+        await interaction.response.send_message(f"Message deletion enabled. Severity threshold: {settings['delete_severity']}", ephemeral=True)
+    
+    elif action == "disable":
+        settings["delete_messages"] = False
+        save_server_config()
+        await interaction.response.send_message("Message deletion disabled.", ephemeral=True)
+    
+    elif action == "status":
+        status = "Enabled" if settings["delete_messages"] else "Disabled"
+        embed = discord.Embed(title="Message Deletion Settings")
+        embed.add_field(name="Status", value=status, inline=True)
+        embed.add_field(name="Severity Threshold", value=str(settings["delete_severity"]), inline=True)
+        embed.add_field(
+            name="Severity Guide",
+            value="1 = Low (bloody, ass)\n2 = Medium (bullshit)\n3 = High (bitch, slurs)\n4 = Extreme (shock)",
+            inline=False
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="cussscoreboard", description="Toggle scoreboard tracking (Admin only)")
+@app_commands.describe(action="Enable or disable scoreboard tracking")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Enable scoreboard", value="enable"),
+    app_commands.Choice(name="Disable scoreboard", value="disable"),
+    app_commands.Choice(name="View status", value="status"),
+])
+async def cussscoreboard(interaction: discord.Interaction, action: str):
+    if not interaction.guild:
+        await interaction.response.send_message("This command only works in servers!", ephemeral=True)
+        return
+    
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You need administrator permission to use this command.", ephemeral=True)
+        return
+    
+    server_id = str(interaction.guild.id)
+    settings = get_server_settings(server_id)
+    
+    if action == "enable":
+        settings["scoreboard_enabled"] = True
+        save_server_config()
+        await interaction.response.send_message("Scoreboard tracking enabled. Cusses will be recorded.", ephemeral=True)
+    
+    elif action == "disable":
+        settings["scoreboard_enabled"] = False
+        save_server_config()
+        await interaction.response.send_message("Scoreboard tracking disabled. Cusses will not be recorded.", ephemeral=True)
+    
+    elif action == "status":
+        status = "Enabled" if settings["scoreboard_enabled"] else "Disabled"
+        await interaction.response.send_message(f"Scoreboard tracking: {status}", ephemeral=True)
+
+@tree.command(name="cussmatch", description="Toggle close match detection (Admin only)")
+@app_commands.describe(action="Enable or disable detection of misspellings and close matches")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Enable close match detection", value="enable"),
+    app_commands.Choice(name="Disable close match detection", value="disable"),
+    app_commands.Choice(name="View status", value="status"),
+])
+async def cussmatch(interaction: discord.Interaction, action: str):
+    if not interaction.guild:
+        await interaction.response.send_message("This command only works in servers!", ephemeral=True)
+        return
+    
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You need administrator permission to use this command.", ephemeral=True)
+        return
+    
+    server_id = str(interaction.guild.id)
+    settings = get_server_settings(server_id)
+    
+    if action == "enable":
+        settings["close_match_detection"] = True
+        save_server_config()
+        await interaction.response.send_message("Close match detection enabled. Misspellings will be detected.", ephemeral=True)
+    
+    elif action == "disable":
+        settings["close_match_detection"] = False
+        save_server_config()
+        await interaction.response.send_message("Close match detection disabled.", ephemeral=True)
+    
+    elif action == "status":
+        status = "Enabled" if settings["close_match_detection"] else "Disabled"
+        await interaction.response.send_message(f"Close match detection: {status}", ephemeral=True)
+
+@tree.command(name="cusstags", description="Configure which tags to filter (Admin only)")
+@app_commands.describe(
+    action="What to do with tags",
+    tag="Tag to add or remove"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Add tag to filter", value="add"),
+    app_commands.Choice(name="Remove tag from filter", value="remove"),
+    app_commands.Choice(name="Clear all (filter everything)", value="clear"),
+    app_commands.Choice(name="View current tags", value="status"),
+])
+@app_commands.choices(tag=[
+    app_commands.Choice(name="general - General swear words", value="general"),
+    app_commands.Choice(name="sexual - Sexual content", value="sexual"),
+    app_commands.Choice(name="lgbtq - LGBTQ slurs", value="lgbtq"),
+    app_commands.Choice(name="racial - Racial slurs", value="racial"),
+    app_commands.Choice(name="religious - Religious terms", value="religious"),
+    app_commands.Choice(name="shock - Shock content", value="shock"),
+])
+async def cusstags(
+    interaction: discord.Interaction,
+    action: str,
+    tag: str = None
+):
+    if not interaction.guild:
+        await interaction.response.send_message("This command only works in servers!", ephemeral=True)
+        return
+    
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You need administrator permission to use this command.", ephemeral=True)
+        return
+    
+    server_id = str(interaction.guild.id)
+    settings = get_server_settings(server_id)
+    
+    if action == "add":
+        if not tag:
+            await interaction.response.send_message("Please specify a tag to add.", ephemeral=True)
             return
-        
-        if check_cooldown(user_id):
+        if tag not in settings["filtered_tags"]:
+            settings["filtered_tags"].append(tag)
+            save_server_config()
+        await interaction.response.send_message(f"Now filtering: {', '.join(settings['filtered_tags']) if settings['filtered_tags'] else 'All tags (default)'}", ephemeral=True)
+    
+    elif action == "remove":
+        if not tag:
+            await interaction.response.send_message("Please specify a tag to remove.", ephemeral=True)
             return
-        
-        response = get_random_response()
-        
-        if settings["response_channel"]:
-            channel = client.get_channel(int(settings["response_channel"]))
-            if channel:
-                await channel.send(f"{message.author.mention}: {response}")
+        if tag in settings["filtered_tags"]:
+            settings["filtered_tags"].remove(tag)
+            save_server_config()
+        await interaction.response.send_message(f"Now filtering: {', '.join(settings['filtered_tags']) if settings['filtered_tags'] else 'All tags (default)'}", ephemeral=True)
+    
+    elif action == "clear":
+        settings["filtered_tags"] = []
+        save_server_config()
+        await interaction.response.send_message("Tag filter cleared. Now filtering all tags (default behavior).", ephemeral=True)
+    
+    elif action == "status":
+        if settings["filtered_tags"]:
+            tags_list = ", ".join(settings["filtered_tags"])
+            await interaction.response.send_message(f"Currently filtering only: {tags_list}\n\nAvailable tags: general, sexual, lgbtq, racial, religious, shock", ephemeral=True)
         else:
-            await message.reply(response)
+            await interaction.response.send_message("Currently filtering: All tags (default)\n\nAvailable tags: general, sexual, lgbtq, racial, religious, shock", ephemeral=True)
 
 @tree.command(name="cussconfig", description="Configure cussbot settings for this server (Admin only)")
 @app_commands.describe(
@@ -280,10 +629,18 @@ async def cussconfig(
     elif action == "status":
         channel_setting = f"<#{settings['response_channel']}>" if settings["response_channel"] else "Same as cusser"
         responses_setting = "Enabled" if settings["responses_enabled"] else "Disabled"
+        delete_setting = "Enabled" if settings["delete_messages"] else "Disabled"
+        scoreboard_setting = "Enabled" if settings["scoreboard_enabled"] else "Disabled"
+        close_match_setting = "Enabled" if settings["close_match_detection"] else "Disabled"
+        tags_setting = ", ".join(settings["filtered_tags"]) if settings["filtered_tags"] else "All"
         
         embed = discord.Embed(title="Cussbot Settings")
         embed.add_field(name="Response Channel", value=channel_setting, inline=True)
         embed.add_field(name="Responses", value=responses_setting, inline=True)
+        embed.add_field(name="Delete Messages", value=f"{delete_setting} (severity {settings['delete_severity']}+)", inline=True)
+        embed.add_field(name="Scoreboard", value=scoreboard_setting, inline=True)
+        embed.add_field(name="Close Match", value=close_match_setting, inline=True)
+        embed.add_field(name="Filtered Tags", value=tags_setting, inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="serverboard", description="Top 10 cussers in this server")
@@ -305,8 +662,7 @@ async def serverboard(interaction: discord.Interaction):
     
     leaderboard = ""
     for i, (user_id, data) in enumerate(top_users, 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        leaderboard += f"{medal} **{data['name']}** - {data['count']} cusses\n"
+        leaderboard += f"{i}. **{data['name']}** - {data['count']} cusses\n"
     
     embed.description = leaderboard
     await interaction.response.send_message(embed=embed)
@@ -323,8 +679,7 @@ async def globalboard(interaction: discord.Interaction):
     
     leaderboard = ""
     for i, (user_id, data) in enumerate(top_users, 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        leaderboard += f"{medal} **{data['name']}** - {data['count']} cusses\n"
+        leaderboard += f"{i}. **{data['name']}** - {data['count']} cusses\n"
     
     embed.description = leaderboard
     await interaction.response.send_message(embed=embed)
